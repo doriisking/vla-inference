@@ -105,6 +105,18 @@ class Config:
     probe_dir: str = "shared/probe"
     """Where the per-rollout progress JSONL goes (host-mounted via shared/)."""
 
+    record: bool = False
+    """Enable read-only episode recording; requires --probe."""
+
+    record_dir: str = "shared/episodes"
+    """Host-mounted directory containing per-run recording sessions."""
+
+    record_every_n: int = 5
+    """Record every Nth prediction (CPU snapshot overhead remains)."""
+
+    record_max_queue: int = 16
+    """Bounded writer queue; drop samples when full."""
+
     # ProgressMonitor thresholds (--probe with --cortex). Tune on real-robot
     # logs; the viewer replays a log under different values (view_progress.py).
     done_threshold: float = 0.70
@@ -220,6 +232,33 @@ def main(config: Config) -> None:
             stall_hold_s=config.stall_hold_s,
         )
 
+    recorder = None
+    record_capture_errors = 0
+    if config.record:
+        if probe is None:
+            raise SystemExit("--record requires --probe to capture the DiT feature")
+        if config.record_every_n < 1 or config.record_max_queue < 1:
+            raise SystemExit("--record-every-n and --record-max-queue must be >= 1")
+        from .recording import EpisodeRecorder, EpisodeSample, snapshot_numpy
+
+        session = f"session_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1000000000:09d}"
+        recorder = EpisodeRecorder(
+            os.path.join(config.record_dir, session),
+            max_queue=config.record_max_queue,
+            metadata={
+                "checkpoint": config.checkpoint,
+                "embodiment_tag": config.embodiment_tag,
+                "probe": config.probe,
+                "prompt_initial": config.prompt,
+                "cortex": config.cortex,
+                "views": views,
+                "record_every_n": config.record_every_n,
+                "progress_log": None if progress_log is None else progress_log.path,
+                "action_note": "predicted ActionChunk; not actual executed feedback",
+            },
+        )
+        print(f"[EpisodeRecorder] recording to {recorder.output_dir}")
+
     try:
         # Wait for the sensors, then warm up the model off-stream: the first
         # prediction pays CUDA init (~1 s) — better spent before gearsonic
@@ -243,6 +282,7 @@ def main(config: Config) -> None:
         last_report = time.monotonic()
         latency_sum = 0.0
         predictions = 0
+        record_seq = 0
         while True:
             t0 = time.monotonic()
             prompt = bridge.instruction() if bridge is not None else config.prompt
@@ -258,6 +298,7 @@ def main(config: Config) -> None:
                 time.sleep(tick_s)
                 continue
 
+            observation_monotonic_ns = time.monotonic_ns() if recorder is not None else 0
             chunk = policy.predict(observation)
             if bridge is not None and bridge.instruction() != prompt:
                 # The subtask was cancelled while this
@@ -315,6 +356,44 @@ def main(config: Config) -> None:
                     progress = raw
                 progress_log.append(progress, elapsed * 1e3, reading=reading, timing=timing)
 
+            # Research recorder never modifies robot control or FSM decisions.
+            # Snapshots (especially CUDA -> CPU) CAN delay the next inference.
+            record_seq += 1
+            if recorder is not None and record_seq % config.record_every_n == 0:
+                try:
+                    feature = probe.feature_for_recording()
+                    if feature is not None:
+                        sample = EpisodeSample(
+                            episode_id="run_0001",  # viewer marks require offline alignment
+                            sample_id=record_seq,
+                            observation_monotonic_ns=observation_monotonic_ns,
+                            inference_monotonic_ns=time.monotonic_ns(),
+                            progress=None if progress is None else float(progress),
+                            progress_state=None if reading is None else reading.state.value,
+                            latent=snapshot_numpy(feature),
+                            action_chunk={
+                                "motion_token": snapshot_numpy(chunk.motion_token),
+                                "left_hand_joints": snapshot_numpy(chunk.left_hand_joints),
+                                "right_hand_joints": snapshot_numpy(chunk.right_hand_joints),
+                            },
+                            rgb={name: snapshot_numpy(frame) for name, frame in observation.video.items()},
+                            robot_state={name: snapshot_numpy(state) for name, state in observation.state.items()},
+                            extras={
+                                "wall_time_ns": time.time_ns(),
+                                "prompt": prompt,
+                                "probe_name": probe.active_name,
+                                "inference_ms": elapsed * 1000.0,
+                                "camera_stamp_ns": observation.camera_stamp_ns,
+                                "camera_age_s": observation.camera_age_s,
+                                "subtask_id": None if machine is None else str(machine.subtask_id()),
+                            },
+                        )
+                        recorder.submit(sample)  # drops if queue full, never blocks
+                except Exception as exc:
+                    record_capture_errors += 1
+                    if record_capture_errors <= 3:
+                        print(f"[EpisodeRecorder] capture skipped: {exc!r}", flush=True)
+
             latency_sum += elapsed
             predictions += 1
             if t0 - last_report >= config.report_s:
@@ -347,6 +426,10 @@ def main(config: Config) -> None:
         if probe is not None:
             probe.detach()
             progress_log.close()
+        if recorder is not None:
+            flushed = recorder.close(timeout=15)
+            print(f"[EpisodeRecorder] closed={flushed} stats={recorder.stats()} "
+                  f"capture_errors={record_capture_errors}", flush=True)
 
 
 if __name__ == "__main__":
