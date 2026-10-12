@@ -173,6 +173,13 @@ class ProgressProbe:
             return None
         return self.active.score(self._feature)
 
+    def feature_for_recording(self) -> "torch.Tensor | None":
+        """Latest pooled 2048-D feature; caller snapshots before next inference.
+
+        Returned tensor may be on CUDA; CPU copy can synchronize inference.
+        """
+        return self._feature
+
     def detach(self) -> None:
         if self._handle is not None:
             self._handle.remove()
